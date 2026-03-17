@@ -10,10 +10,13 @@ cython
 scikit-image # skimage
 onnxruntime
 gradio
+pygame
+pillow
+mediapipe
 imutils==0.5.3
 opencv-contrib-python==4.8.1.78
 opencv-python>=4.8.1.78
-dlib==19.20.0
-numpy==1.22.0
+dlib-bin==19.24.6
+numpy==1.26.4
 cmake==3.18.0
-scipy==1.5.1
+scipy==1.11.4

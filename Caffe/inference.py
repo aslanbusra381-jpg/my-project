@@ -1,249 +1,489 @@
-import cv2
-import time
-import imutils
 import argparse
-import numpy as np
+import ctypes
+from pathlib import Path
+from typing import Iterable, Tuple
+
+import cv2
 import mediapipe as mp
+import numpy as np
 from scipy.spatial import distance as dist
-import math
-from imutils.video import FPS
-from imutils.video import VideoStream
-
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-smile_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_smile.xml')
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(min_detection_confidence=0.1, min_tracking_confidence=0.1)
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(max_num_faces=1, min_detection_confidence=0.5, min_tracking_confidence=0.5)
-mp_drawing = mp.solutions.drawing_utils
-
-model_points = np.array([
-    (0.0, 0.0, 0.0),  # Bout du nez
-    (-30.0, -125.0, -30.0),  # Coin gauche de l'œil
-    (30.0, -125.0, -30.0),  # Coin droit de l'œil
-    (-60.0, -70.0, -60.0),  # Coin gauche de la bouche
-    (60.0, -70.0, -60.0),  # Coin droit de la bouche
-    (0.0, -330.0, -65.0)    # Menton
-])
-
-def isRotationMatrix(R):
-    Rt = np.transpose(R)
-    shouldBeIdentity = np.dot(Rt, R)
-    I = np.identity(3, dtype=R.dtype)
-    n = np.linalg.norm(I - shouldBeIdentity)
-    return n < 1e-6
-
-def rotationMatrixToEulerAngles(R):
-    assert(isRotationMatrix(R))
-    sy = math.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
-    singular = sy < 1e-6
-    if not singular:
-        x = math.atan2(R[2, 1], R[2, 2])
-        y = math.atan2(-R[2, 0], sy)
-        z = math.atan2(R[1, 0], R[0, 0])
-    else:
-        x = math.atan2(-R[1, 2], R[1, 1])
-        y = math.atan2(-R[2, 0], sy)
-        z = 0
-    return np.array([x, y, z])
-
-def calculate_ear(eye_landmarks):
-    A = dist.euclidean(eye_landmarks[1], eye_landmarks[5])
-    B = dist.euclidean(eye_landmarks[2], eye_landmarks[4])
-    C = dist.euclidean(eye_landmarks[0], eye_landmarks[3])  
-    ear = (A + B) / (2.0 * C)
-    return ear
 
 
-ap = argparse.ArgumentParser()
-ap.add_argument("-p", "--prototxt", required=True, help='Path to prototxt')
-ap.add_argument("-m", "--model", required=True, help='Path to model weights')
-ap.add_argument("-c", "--confidence", type=float, default=0.7, help='Minimum probability to filter weak detections')
-args = vars(ap.parse_args())
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_PROTOTXT = REPO_ROOT / "Caffe" / "pro.txt"
+DEFAULT_MODEL = REPO_ROOT / "Caffe" / "SSD.caffemode"
+
+FACE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+SMILE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_smile.xml"
+)
 
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
-NOSE_TIP = 1
-Mouth = [61, 185, 40, 39, 37, 0, 267, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146, 61]
 
-labels = ["background", "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat", "cell phone", "cow", 
-          "diningtable", "dog", "horse", "motorbike", "person", "pottedplant", "sheep", "sofa", "train", "tvmonitor"]
-FACE_68_LANDMARKS = [  1, 33, 61, 291, 199, 263, 362, 385, 387, 373, 380, 33, 160, 158, 133, 153, 144, 362, 385, 387, 263, 373, 380, 61, 185, 40, 39, 37, 0, 267, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146, 61 ]
+MODEL_POINTS = np.array(
+    [
+        (0.0, 0.0, 0.0),
+        (-30.0, -125.0, -30.0),
+        (30.0, -125.0, -30.0),
+        (-60.0, -70.0, -60.0),
+        (60.0, -70.0, -60.0),
+        (0.0, -330.0, -65.0),
+    ],
+    dtype="double",
+)
 
-colors = np.random.uniform(0, 255, size=(len(labels), 3))
+LABELS = [
+    "background",
+    "aeroplane",
+    "bicycle",
+    "bird",
+    "boat",
+    "bottle",
+    "bus",
+    "car",
+    "cat",
+    "cell phone",
+    "cow",
+    "diningtable",
+    "dog",
+    "horse",
+    "motorbike",
+    "person",
+    "pottedplant",
+    "sheep",
+    "sofa",
+    "train",
+    "tvmonitor",
+]
+COLORS = np.random.uniform(0, 255, size=(len(LABELS), 3))
 
-print('[Status] SafeDriveVersionV2 Loading...')
-nn = cv2.dnn.readNetFromCaffe(args['prototxt'], args['model'])
 
-print('[Status] Starting Video Stream...')
-vs = VideoStream(src=0).start()
-time.sleep(2.0)
-fps = FPS().start()
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="SafeDriveVision Caffe + MediaPipe driver monitoring demo"
+    )
+    parser.add_argument(
+        "-p",
+        "--prototxt",
+        default=str(DEFAULT_PROTOTXT),
+        help="Path to the Caffe prototxt file",
+    )
+    parser.add_argument(
+        "-m",
+        "--model",
+        default=str(DEFAULT_MODEL),
+        help="Path to the Caffe model weights",
+    )
+    parser.add_argument(
+        "-c",
+        "--confidence",
+        type=float,
+        default=0.7,
+        help="Minimum confidence for object detections",
+    )
+    parser.add_argument(
+        "--source",
+        default="0",
+        help='Camera index, image/video path, or "blank" for a synthetic test frame',
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=960,
+        help="Resize width for video frames",
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=int,
+        default=0,
+        help="Stop after N frames. 0 means run until closed.",
+    )
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Run without opening OpenCV windows",
+    )
+    parser.add_argument(
+        "--save-output",
+        type=str,
+        default="",
+        help="Optional path to save the annotated frame in single-frame runs",
+    )
+    return parser.parse_args()
 
-def detect_hands_on_wheel(hand_landmarks):
-    if len(hand_landmarks) == 2:  
-        hand1 = hand_landmarks[0]
-        hand2 = hand_landmarks[1]
-        distance_between_hands = dist.euclidean(
-            (hand1.landmark[mp_hands.HandLandmark.WRIST].x, hand1.landmark[mp_hands.HandLandmark.WRIST].y),
-            (hand2.landmark[mp_hands.HandLandmark.WRIST].x, hand2.landmark[mp_hands.HandLandmark.WRIST].y)
-        )
-        if distance_between_hands < 0.1: 
-            return True
-    return False
 
-def get_hand_side(hand_landmarks):
+def calculate_ear(eye_landmarks: Iterable[Tuple[int, int]]) -> float:
+    eye_landmarks = list(eye_landmarks)
+    vertical_1 = dist.euclidean(eye_landmarks[1], eye_landmarks[5])
+    vertical_2 = dist.euclidean(eye_landmarks[2], eye_landmarks[4])
+    horizontal = dist.euclidean(eye_landmarks[0], eye_landmarks[3])
+    if horizontal == 0:
+        return 0.0
+    return (vertical_1 + vertical_2) / (2.0 * horizontal)
+
+
+def rotation_matrix_to_euler_angles(rotation_matrix: np.ndarray) -> np.ndarray:
+    sy = np.sqrt(rotation_matrix[0, 0] ** 2 + rotation_matrix[1, 0] ** 2)
+    singular = sy < 1e-6
+    if not singular:
+        x_angle = np.arctan2(rotation_matrix[2, 1], rotation_matrix[2, 2])
+        y_angle = np.arctan2(-rotation_matrix[2, 0], sy)
+        z_angle = np.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
+    else:
+        x_angle = np.arctan2(-rotation_matrix[1, 2], rotation_matrix[1, 1])
+        y_angle = np.arctan2(-rotation_matrix[2, 0], sy)
+        z_angle = 0.0
+    return np.array([x_angle, y_angle, z_angle], dtype=float)
+
+
+def resize_frame(frame: np.ndarray, width: int) -> np.ndarray:
+    current_height, current_width = frame.shape[:2]
+    if current_width <= width:
+        return frame
+    ratio = width / float(current_width)
+    new_height = int(current_height * ratio)
+    return cv2.resize(frame, (width, new_height))
+
+
+def detect_hands_on_wheel(hand_landmarks, mp_hands) -> bool:
+    if len(hand_landmarks) != 2:
+        return False
+    hand1, hand2 = hand_landmarks
+    point1 = (
+        hand1.landmark[mp_hands.HandLandmark.WRIST].x,
+        hand1.landmark[mp_hands.HandLandmark.WRIST].y,
+    )
+    point2 = (
+        hand2.landmark[mp_hands.HandLandmark.WRIST].x,
+        hand2.landmark[mp_hands.HandLandmark.WRIST].y,
+    )
+    return dist.euclidean(point1, point2) < 0.1
+
+
+def get_hand_side(hand_landmarks, mp_hands) -> str:
     thumb_tip_x = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP].x
     wrist_x = hand_landmarks.landmark[mp_hands.HandLandmark.WRIST].x
-    if thumb_tip_x < wrist_x:
-        return "Left Hand"
-    else:
-        return "Right Hand"
+    return "Left Hand" if thumb_tip_x < wrist_x else "Right Hand"
 
-while True:
-    frame = vs.read()
-    frame = imutils.resize(frame, width=600)
-    (h, w) = frame.shape[:2]
-    
-    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
-    nn.setInput(blob)
-    detections = nn.forward()
 
-    detected_objects = []
+def add_unique(items: list[str], value: str) -> None:
+    if value not in items:
+        items.append(value)
+
+
+def analyze_frame(
+    frame: np.ndarray,
+    net,
+    hands,
+    face_mesh,
+    mp_hands,
+    mp_face_mesh,
+    mp_drawing,
+    confidence_threshold: float,
+) -> Tuple[np.ndarray, np.ndarray, list[str]]:
+    frame = frame.copy()
+    detected_objects: list[str] = []
+    height, width = frame.shape[:2]
+
+    blob = cv2.dnn.blobFromImage(
+        cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5
+    )
+    net.setInput(blob)
+    detections = net.forward()
 
     for i in np.arange(0, detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-        
-        if confidence > args['confidence']:
-            idx = int(detections[0, 0, i, 1])
-            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-            (startX, startY, endX, endY) = box.astype("int")
-            label = "{}: {:.2f}%".format(labels[idx], confidence * 100)
-            cv2.rectangle(frame, (startX, startY), (endX, endY), colors[idx], 2)
-            y = startY - 15 if startY - 15 > 15 else startY + 15
-            cv2.putText(frame, label, (startX, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[idx], 2)
-            detected_objects.append(label)
-            if idx == 9:
-                detected_objects.append("Cell Phone Detected")
-    
+        confidence = float(detections[0, 0, i, 2])
+        if confidence < confidence_threshold:
+            continue
+
+        idx = int(detections[0, 0, i, 1])
+        if idx < 0 or idx >= len(LABELS):
+            continue
+
+        box = detections[0, 0, i, 3:7] * np.array([width, height, width, height])
+        start_x, start_y, end_x, end_y = box.astype("int")
+        label = f"{LABELS[idx]}: {confidence * 100:.1f}%"
+        color = COLORS[idx]
+
+        cv2.rectangle(frame, (start_x, start_y), (end_x, end_y), color, 2)
+        text_y = start_y - 15 if start_y - 15 > 15 else start_y + 15
+        cv2.putText(
+            frame,
+            label,
+            (start_x, text_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2,
+        )
+        add_unique(detected_objects, label)
+        if LABELS[idx] == "cell phone":
+            add_unique(detected_objects, "Cell Phone Detected")
+
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result_hands = hands.process(frame_rgb)
-    result_face_mesh = face_mesh.process(frame_rgb)
-    
+    hand_results = hands.process(frame_rgb)
+    face_results = face_mesh.process(frame_rgb)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # Detect faces
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+    faces = FACE_CASCADE.detectMultiScale(
+        gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30)
+    )
     for (x, y, w, h) in faces:
-        cv2.rectangle(frame, (x, y), (x+w, y+h), (255,0, 0), 3)
-        face_gray = gray[y:y+h, x:x+w]
-        face_color = frame[y:y+h, x:x+w]
-        
-        # Detect smiles
-        smiles = smile_cascade.detectMultiScale(face_gray, scaleFactor=1.7, minNeighbors=20)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 0), 2)
+        face_gray = gray[y : y + h, x : x + w]
+        face_color = frame[y : y + h, x : x + w]
+        smiles = SMILE_CASCADE.detectMultiScale(
+            face_gray, scaleFactor=1.7, minNeighbors=20
+        )
         for (sx, sy, sw, sh) in smiles:
-            cv2.rectangle(face_color, (sx, sy), (sx+sw, sy+sh), (255, 0, 0), 2)
-            detected_objects.append("Smile Detected")
-    
+            cv2.rectangle(face_color, (sx, sy), (sx + sw, sy + sh), (255, 255, 0), 2)
+            add_unique(detected_objects, "Smile Detected")
 
-# Detect hands
-    if result_hands.multi_hand_landmarks:
-        if detect_hands_on_wheel(result_hands.multi_hand_landmarks):
-            detected_objects.append("Hands on Wheel")
+    if hand_results.multi_hand_landmarks:
+        if detect_hands_on_wheel(hand_results.multi_hand_landmarks, mp_hands):
+            add_unique(detected_objects, "Hands on Wheel")
         else:
-            detected_objects.append("Hands off Wheel")
-            
-        for hand_landmarks in result_hands.multi_hand_landmarks:
-            hand_side = get_hand_side(hand_landmarks)
-            detected_objects.append(hand_side)
-            
-            # Draw landmarks
-            mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+            add_unique(detected_objects, "Hands off Wheel")
+
+        for hand_landmarks in hand_results.multi_hand_landmarks:
+            add_unique(detected_objects, get_hand_side(hand_landmarks, mp_hands))
+            mp_drawing.draw_landmarks(
+                frame, hand_landmarks, mp_hands.HAND_CONNECTIONS
+            )
 
             thumb_tip = hand_landmarks.landmark[mp_hands.HandLandmark.THUMB_TIP]
-            index_finger_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
-            distance = dist.euclidean(
+            index_tip = hand_landmarks.landmark[mp_hands.HandLandmark.INDEX_FINGER_TIP]
+            fingertip_distance = dist.euclidean(
                 (thumb_tip.x, thumb_tip.y),
-                (index_finger_tip.x, index_finger_tip.y)
+                (index_tip.x, index_tip.y),
             )
-            if distance < 0.05:  # Threshold to detect pinch or holding small object
-                detected_objects.append("Manipulating Object")
+            if fingertip_distance < 0.05:
+                add_unique(detected_objects, "Manipulating Object")
             else:
-                detected_objects.append("No Object Manipulation")
-    # Detect face mesh
-    if result_face_mesh.multi_face_landmarks:
-        for face_landmarks in result_face_mesh.multi_face_landmarks:
-            mp_drawing.draw_landmarks(frame, face_landmarks, mp_face_mesh.FACEMESH_TESSELATION,
-                                      mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=1),
-                                      mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=1, circle_radius=1))
-                
+                add_unique(detected_objects, "No Object Manipulation")
+
+    if face_results.multi_face_landmarks:
+        for face_landmarks in face_results.multi_face_landmarks:
+            mp_drawing.draw_landmarks(
+                frame,
+                face_landmarks,
+                mp_face_mesh.FACEMESH_TESSELATION,
+                mp_drawing.DrawingSpec(color=(255, 255, 255), thickness=1, circle_radius=1),
+                mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=1, circle_radius=1),
+            )
+
             landmarks = face_landmarks.landmark
-            left_eye_landmarks = [face_landmarks.landmark[i] for i in LEFT_EYE]
-            right_eye_landmarks = [face_landmarks.landmark[i] for i in RIGHT_EYE]
-            left_eye_points = [(int(point.x * frame.shape[1]), int(point.y * frame.shape[0])) for point in left_eye_landmarks]
-            right_eye_points = [(int(point.x * frame.shape[1]), int(point.y * frame.shape[0])) for point in right_eye_landmarks]
+            left_eye_points = [
+                (
+                    int(landmarks[idx].x * width),
+                    int(landmarks[idx].y * height),
+                )
+                for idx in LEFT_EYE
+            ]
+            right_eye_points = [
+                (
+                    int(landmarks[idx].x * width),
+                    int(landmarks[idx].y * height),
+                )
+                for idx in RIGHT_EYE
+            ]
+            ear = (calculate_ear(left_eye_points) + calculate_ear(right_eye_points)) / 2.0
 
-            left_ear = calculate_ear(left_eye_points)
-            right_ear = calculate_ear(right_eye_points)
-            ear = (left_ear + right_ear) / 2.0
-            
-            if ear < 0.25:
-                detected_objects.append("Eyes Closed")
-            else:
-                detected_objects.append("Eyes Open")
+            add_unique(detected_objects, "Eyes Closed" if ear < 0.25 else "Eyes Open")
 
-            image_points = np.array([
-                (landmarks[1].x * frame.shape[1], landmarks[1].y * frame.shape[0]),  # Bout du nez
-                (landmarks[33].x * frame.shape[1], landmarks[33].y * frame.shape[0]),  # Coin gauche de l'œil
-                (landmarks[263].x * frame.shape[1], landmarks[263].y * frame.shape[0]),  # Coin droit de l'œil
-                (landmarks[61].x * frame.shape[1], landmarks[61].y * frame.shape[0]),  # Coin gauche de la bouche
-                (landmarks[291].x * frame.shape[1], landmarks[291].y * frame.shape[0]),  # Coin droit de la bouche
-                (landmarks[199].x * frame.shape[1], landmarks[199].y * frame.shape[0])  # Menton
-            ], dtype="double")
-            size = frame.shape[1], frame.shape[0]
-            focal_length = size[1]
-            center = (size[1] / 2, size[0] / 2)
-            camera_matrix = np.array([[focal_length, 0, center[0]], [0, focal_length, center[1]], [0, 0, 1]], dtype="double")
-            dist_coeffs = np.zeros((4, 1)) 
+            image_points = np.array(
+                [
+                    (landmarks[1].x * width, landmarks[1].y * height),
+                    (landmarks[33].x * width, landmarks[33].y * height),
+                    (landmarks[263].x * width, landmarks[263].y * height),
+                    (landmarks[61].x * width, landmarks[61].y * height),
+                    (landmarks[291].x * width, landmarks[291].y * height),
+                    (landmarks[199].x * width, landmarks[199].y * height),
+                ],
+                dtype="double",
+            )
 
-            success, rotation_vector, translation_vector = cv2.solvePnP(model_points, image_points, camera_matrix, dist_coeffs)
-            rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-            angles = rotationMatrixToEulerAngles(rotation_matrix)
-            
-            if abs(angles[1]) > 0.25:
-                detected_objects.append("Not Looking Ahead")
-            elif abs(angles[1]) < 0.07:
-                detected_objects.append("Not Looking Ahead")
-            else:
-                detected_objects.append("Looking Ahead")
-            
-            if abs(angles[0]) < 1.4 :
-                detected_objects.append("Looking Down")
-            elif abs(angles[0]) > 1.6 :
-                detected_objects.append("Looking Up")
-            else :
-                detected_objects.append("Looking Straight")
-            
-            detected_objects.append("Pitch: {:.2f} Yaw: {:.2f} Roll: {:.2f}".format(angles[0], angles[1], angles[2]))
+            focal_length = width
+            center = (width / 2.0, height / 2.0)
+            camera_matrix = np.array(
+                [
+                    [focal_length, 0, center[0]],
+                    [0, focal_length, center[1]],
+                    [0, 0, 1],
+                ],
+                dtype="double",
+            )
+            dist_coeffs = np.zeros((4, 1))
+            success, rotation_vector, translation_vector = cv2.solvePnP(
+                MODEL_POINTS, image_points, camera_matrix, dist_coeffs
+            )
 
-    info_display = np.zeros((300, 600, 3), dtype=np.uint8)
+            if success:
+                rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+                angles = rotation_matrix_to_euler_angles(rotation_matrix)
+                yaw = float(angles[1])
+                pitch = float(angles[0])
+                roll = float(angles[2])
 
+                if -0.07 <= yaw <= 0.25:
+                    add_unique(detected_objects, "Looking Ahead")
+                else:
+                    add_unique(detected_objects, "Not Looking Ahead")
+
+                if pitch < 1.4:
+                    add_unique(detected_objects, "Looking Down")
+                elif pitch > 1.6:
+                    add_unique(detected_objects, "Looking Up")
+                else:
+                    add_unique(detected_objects, "Looking Straight")
+
+                add_unique(
+                    detected_objects,
+                    f"Pitch: {pitch:.2f} Yaw: {yaw:.2f} Roll: {roll:.2f}",
+                )
+
+    info_height = max(300, 30 * (len(detected_objects) + 1))
+    info_display = np.zeros((info_height, 600, 3), dtype=np.uint8)
     for idx, text in enumerate(detected_objects):
-        cv2.putText(info_display, text, (10, (idx + 1) * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    
-    cv2.imshow("Frame", frame)
-    cv2.imshow("Info", info_display)
-    
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord("q"):
-        break
-    
-    fps.update()
+        cv2.putText(
+            info_display,
+            text,
+            (10, 30 * (idx + 1)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+        )
 
-fps.stop()
-print("[Info] Elapsed time: {:.2f}".format(fps.elapsed()))
-print("[Info] Approximate FPS: {:.2f}".format(fps.fps()))
+    return frame, info_display, detected_objects
 
-# Cleanup
-cv2.destroyAllWindows()
-vs.stop()
+
+def resolve_source(source: str):
+    if source.lower() == "blank":
+        return "blank"
+    if source.isdigit():
+        return int(source)
+    return str(Path(source).expanduser().resolve())
+
+
+def validate_paths(prototxt_path: Path, model_path: Path) -> None:
+    if not prototxt_path.exists():
+        raise FileNotFoundError(f"Prototxt file not found: {prototxt_path}")
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+
+def to_opencv_path(path: Path) -> str:
+    path_str = str(path)
+    if not path.exists():
+        return path_str
+
+    buffer_size = 4096
+    buffer = ctypes.create_unicode_buffer(buffer_size)
+    result = ctypes.windll.kernel32.GetShortPathNameW(path_str, buffer, buffer_size)
+    if result:
+        return buffer.value
+    return path_str
+
+
+def write_image(path: str, image: np.ndarray) -> bool:
+    output_path = Path(path).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    success, encoded = cv2.imencode(output_path.suffix or ".jpg", image)
+    if not success:
+        return False
+    encoded.tofile(str(output_path))
+    return True
+
+
+def main() -> None:
+    args = parse_args()
+    prototxt_path = Path(args.prototxt).expanduser().resolve()
+    model_path = Path(args.model).expanduser().resolve()
+    validate_paths(prototxt_path, model_path)
+
+    print("[Status] SafeDriveVision Caffe + MediaPipe loading...")
+    net = cv2.dnn.readNetFromCaffe(
+        to_opencv_path(prototxt_path), to_opencv_path(model_path)
+    )
+    resolved_source = resolve_source(args.source)
+
+    mp_hands = mp.solutions.hands
+    mp_face_mesh = mp.solutions.face_mesh
+    mp_drawing = mp.solutions.drawing_utils
+
+    with mp_hands.Hands(
+        min_detection_confidence=0.1, min_tracking_confidence=0.1
+    ) as hands, mp_face_mesh.FaceMesh(
+        max_num_faces=1, min_detection_confidence=0.5, min_tracking_confidence=0.5
+    ) as face_mesh:
+        if resolved_source == "blank":
+            frame = np.zeros((540, 960, 3), dtype=np.uint8)
+            annotated, info_display, detected = analyze_frame(
+                frame,
+                net,
+                hands,
+                face_mesh,
+                mp_hands,
+                mp_face_mesh,
+                mp_drawing,
+                args.confidence,
+            )
+            print(f"[Status] Smoke test completed. Findings: {detected or ['none']}")
+            if args.save_output:
+                write_image(args.save_output, annotated)
+            if not args.no_display:
+                cv2.imshow("Frame", annotated)
+                cv2.imshow("Info", info_display)
+                cv2.waitKey(0)
+                cv2.destroyAllWindows()
+            return
+
+        capture = cv2.VideoCapture(resolved_source)
+        if not capture.isOpened():
+            raise RuntimeError(f"Could not open source: {args.source}")
+
+        print("[Status] Video stream started. Press 'q' to quit.")
+        processed_frames = 0
+        try:
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+
+                frame = resize_frame(frame, args.width)
+                annotated, info_display, _ = analyze_frame(
+                    frame,
+                    net,
+                    hands,
+                    face_mesh,
+                    mp_hands,
+                    mp_face_mesh,
+                    mp_drawing,
+                    args.confidence,
+                )
+                processed_frames += 1
+
+                if args.save_output and processed_frames == 1:
+                    write_image(args.save_output, annotated)
+
+                if not args.no_display:
+                    cv2.imshow("Frame", annotated)
+                    cv2.imshow("Info", info_display)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
+
+                if args.max_frames and processed_frames >= args.max_frames:
+                    break
+        finally:
+            capture.release()
+            cv2.destroyAllWindows()
+
+        print(f"[Status] Processed {processed_frames} frame(s).")
+
+
+if __name__ == "__main__":
+    main()

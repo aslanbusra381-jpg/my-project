@@ -1,1 +1,7 @@
 
+.venv/
+__pycache__/
+*.pyc
+_wheelhouse/
+camera_backend_test/
+smoke-test-output.jpg
