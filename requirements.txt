@@ -1,0 +1,19 @@
+torch
+torchvision
+matplotlib
+imageio
+imageio-ffmpeg
+pyyaml # yaml
+tqdm
+argparse
+cython
+scikit-image # skimage
+onnxruntime
+gradio
+imutils==0.5.3
+opencv-contrib-python==4.8.1.78
+opencv-python>=4.8.1.78
+dlib==19.20.0
+numpy==1.22.0
+cmake==3.18.0
+scipy==1.5.1
